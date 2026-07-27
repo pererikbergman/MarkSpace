@@ -77,6 +77,24 @@ impl WorkspaceList {
         }
     }
 
+    /// Activate the next workspace down the list (clamped at the last).
+    pub fn select_next(&mut self) {
+        if let Some(i) = self.active {
+            self.select((i + 1).min(self.items.len().saturating_sub(1)));
+        } else if !self.items.is_empty() {
+            self.select(0);
+        }
+    }
+
+    /// Activate the previous workspace up the list (clamped at the first).
+    pub fn select_prev(&mut self) {
+        if let Some(i) = self.active {
+            self.select(i.saturating_sub(1));
+        } else if !self.items.is_empty() {
+            self.select(0);
+        }
+    }
+
     /// The currently active workspace, if any.
     pub fn active(&self) -> Option<&Workspace> {
         self.active.map(|i| &self.items[i])
@@ -299,6 +317,29 @@ mod tests {
         let workspace = Workspace::open(sub).unwrap();
 
         assert_eq!(workspace.name(), "my-notes");
+    }
+
+    #[test]
+    fn select_next_and_prev_walk_the_list_and_clamp() {
+        let (a, b, c) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+        let mut list = WorkspaceList::new();
+        list.open(a.path().to_path_buf());
+        list.open(b.path().to_path_buf());
+        list.open(c.path().to_path_buf()); // active = c (index 2)
+
+        list.select(0); // a
+        list.select_next();
+        assert_eq!(list.active().map(|w| &w.root), Some(&b.path().to_path_buf()));
+        list.select_next();
+        assert_eq!(list.active().map(|w| &w.root), Some(&c.path().to_path_buf()));
+        list.select_next(); // clamp at last
+        assert_eq!(list.active().map(|w| &w.root), Some(&c.path().to_path_buf()));
+
+        list.select_prev();
+        assert_eq!(list.active().map(|w| &w.root), Some(&b.path().to_path_buf()));
+        list.select_prev();
+        list.select_prev(); // clamp at first
+        assert_eq!(list.active().map(|w| &w.root), Some(&a.path().to_path_buf()));
     }
 
     #[test]
