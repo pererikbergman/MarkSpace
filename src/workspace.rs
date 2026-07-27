@@ -1,160 +1,160 @@
-//! Layout state machine for MarkSpace's panels.
+//! A workspace: an opened folder (a directory root) and its top-level File
+//! Tree listing.
 //!
-//! Pure state with no dependency on egui. `MarkSpaceApp` reads this to decide
-//! which panels to draw and wires keyboard shortcuts to its toggle methods.
-//! See `CONTEXT.md` for the vocabulary (projects pane, context column, quick
-//! info, focus mode).
+//! Opening a folder — by drag-and-drop, cmux-style — creates a workspace whose
+//! contents populate the File Tree. Pure filesystem logic with no dependency on
+//! egui, so it stays unit-testable. `MarkSpaceApp` opens a workspace from a
+//! dropped path, kicks off a background scan, and drains the entries into the
+//! File Tree. See `CONTEXT.md` for the vocabulary (workspace, File Tree, entry).
 
-/// Visibility and layout state for MarkSpace's panels.
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+
+use walkdir::WalkDir;
+
+/// An open workspace: a directory root whose contents feed the File Tree.
 pub struct Workspace {
-    /// Far-left projects pane (`Cmd/Ctrl + 1`).
-    pub show_projects_pane: bool,
-    /// Far-right context column: file tree + quick info (`Cmd/Ctrl + 2`).
-    pub show_context_column: bool,
-    /// Quick info sub-panel expanded vs collapsed to status bar (`Cmd/Ctrl + I`).
-    pub quick_info_expanded: bool,
-    /// Focus mode: both side panels collapsed (`Cmd/Ctrl + Shift + F`).
-    pub focus_mode: bool,
-    /// Snapshot of `(show_projects_pane, show_context_column)` taken on entering
-    /// focus mode, restored on exit. `None` when not in focus mode.
-    focus_snapshot: Option<(bool, bool)>,
+    pub root: PathBuf,
 }
 
 impl Workspace {
-    /// A workspace with the PRD's default `config.toml` layout.
-    pub fn new() -> Self {
-        Self {
-            show_projects_pane: true,
-            show_context_column: true,
-            quick_info_expanded: true,
-            focus_mode: false,
-            focus_snapshot: None,
-        }
-    }
-
-    /// Toggle the far-left projects pane.
-    pub fn toggle_projects_pane(&mut self) {
-        self.show_projects_pane = !self.show_projects_pane;
-    }
-
-    /// Toggle the far-right context column.
-    pub fn toggle_context_column(&mut self) {
-        self.show_context_column = !self.show_context_column;
-    }
-
-    /// Toggle the quick info sub-panel between expanded and collapsed.
-    pub fn toggle_quick_info(&mut self) {
-        self.quick_info_expanded = !self.quick_info_expanded;
-    }
-
-    /// Toggle focus mode. Entering snapshots both side panels' visibility and
-    /// hides them; exiting restores the snapshot (a pane hidden beforehand
-    /// stays hidden).
-    pub fn toggle_focus_mode(&mut self) {
-        match self.focus_snapshot.take() {
-            None => {
-                self.focus_snapshot = Some((self.show_projects_pane, self.show_context_column));
-                self.show_projects_pane = false;
-                self.show_context_column = false;
-                self.focus_mode = true;
-            }
-            Some((projects, context)) => {
-                self.show_projects_pane = projects;
-                self.show_context_column = context;
-                self.focus_mode = false;
-            }
-        }
+    /// Open `path` as a workspace, or `None` if it isn't a directory (so a
+    /// dropped file or a bad path is ignored rather than crashing).
+    pub fn open(path: PathBuf) -> Option<Workspace> {
+        path.is_dir().then_some(Workspace { root: path })
     }
 }
 
-impl Default for Workspace {
-    fn default() -> Self {
-        Self::new()
-    }
+/// One top-level item shown in the File Tree.
+pub struct Entry {
+    pub name: String,
+    /// Absolute path. Consumed by File Tree selection in issue #3; the display
+    /// glue only needs `name`/`is_dir` for now.
+    #[allow(dead_code)]
+    pub path: PathBuf,
+    pub is_dir: bool,
+}
+
+/// Scan a directory's immediate children (depth 1).
+pub fn scan_children(root: &Path) -> Vec<Entry> {
+    let mut sorted: Vec<Entry> = WalkDir::new(root)
+        .min_depth(1)
+        .max_depth(1)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| Entry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            is_dir: entry.file_type().is_dir(),
+            path: entry.into_path(),
+        })
+        .collect();
+
+    // Directories before files, then case-insensitive alphabetical within each.
+    sorted.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    sorted
+}
+
+/// Scan `root` on a background thread, delivering the sorted entries over a
+/// channel so the UI thread never blocks on disk I/O (PRD §4.1). The receiver
+/// yields exactly one message when the scan completes.
+pub fn spawn_scan(root: PathBuf) -> Receiver<Vec<Entry>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        // If the receiver was dropped (workspace changed), the send just fails.
+        let _ = tx.send(scan_children(&root));
+    });
+    rx
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
-    fn new_workspace_uses_prd_default_visibility() {
-        let ws = Workspace::new();
+    fn scan_children_lists_immediate_entries() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("notes")).unwrap();
+        fs::write(dir.path().join("readme.md"), "hi").unwrap();
 
-        assert!(ws.show_projects_pane, "projects pane visible by default");
-        assert!(ws.show_context_column, "context column visible by default");
-        assert!(ws.quick_info_expanded, "quick info expanded by default");
-        assert!(!ws.focus_mode, "focus mode off by default");
+        let entries = scan_children(dir.path());
+        let by_name: Vec<(&str, bool)> =
+            entries.iter().map(|e| (e.name.as_str(), e.is_dir)).collect();
+
+        assert!(by_name.contains(&("notes", true)));
+        assert!(by_name.contains(&("readme.md", false)));
+        assert_eq!(entries.len(), 2);
     }
 
     #[test]
-    fn toggle_projects_pane_flips_visibility() {
-        let mut ws = Workspace::new();
+    fn scan_children_sorts_dirs_first_then_case_insensitive_alpha() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("banana.txt"), "").unwrap();
+        fs::create_dir(dir.path().join("Apple")).unwrap();
+        fs::create_dir(dir.path().join("cherry")).unwrap();
+        fs::write(dir.path().join("date.md"), "").unwrap();
 
-        ws.toggle_projects_pane();
-        assert!(!ws.show_projects_pane);
+        let order: Vec<String> = scan_children(dir.path())
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
 
-        ws.toggle_projects_pane();
-        assert!(ws.show_projects_pane);
+        assert_eq!(order, ["Apple", "cherry", "banana.txt", "date.md"]);
     }
 
     #[test]
-    fn toggle_context_column_flips_visibility() {
-        let mut ws = Workspace::new();
+    fn scan_children_excludes_nested_entries() {
+        let dir = tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("deep.md"), "").unwrap();
 
-        ws.toggle_context_column();
-        assert!(!ws.show_context_column);
+        let names: Vec<String> = scan_children(dir.path())
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
 
-        ws.toggle_context_column();
-        assert!(ws.show_context_column);
+        assert_eq!(names, ["sub"], "only the immediate child, not deep.md");
     }
 
     #[test]
-    fn toggle_quick_info_flips_expanded() {
-        let mut ws = Workspace::new();
-
-        ws.toggle_quick_info();
-        assert!(!ws.quick_info_expanded);
-
-        ws.toggle_quick_info();
-        assert!(ws.quick_info_expanded);
+    fn open_accepts_a_directory() {
+        let dir = tempdir().unwrap();
+        let workspace = Workspace::open(dir.path().to_path_buf());
+        assert_eq!(workspace.map(|w| w.root), Some(dir.path().to_path_buf()));
     }
 
     #[test]
-    fn entering_focus_mode_hides_both_panes() {
-        let mut ws = Workspace::new();
+    fn open_rejects_a_file_or_missing_path() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("note.md");
+        fs::write(&file, "").unwrap();
 
-        ws.toggle_focus_mode();
-
-        assert!(ws.focus_mode);
-        assert!(!ws.show_projects_pane);
-        assert!(!ws.show_context_column);
+        assert!(Workspace::open(file).is_none(), "a file is not a workspace");
+        assert!(
+            Workspace::open(dir.path().join("nope")).is_none(),
+            "a missing path is not a workspace"
+        );
     }
 
     #[test]
-    fn exiting_focus_mode_restores_prior_pane_state() {
-        let mut ws = Workspace::new();
-        // Projects pane hidden before focus mode; context column left visible.
-        ws.toggle_projects_pane();
+    fn spawn_scan_delivers_entries_over_the_channel() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("readme.md"), "").unwrap();
 
-        ws.toggle_focus_mode(); // enter — both hidden
-        ws.toggle_focus_mode(); // exit — restore snapshot
+        let rx = spawn_scan(dir.path().to_path_buf());
+        let entries = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("scan result should arrive on the channel");
 
-        assert!(!ws.focus_mode);
-        assert!(!ws.show_projects_pane, "was hidden before, stays hidden");
-        assert!(ws.show_context_column, "was visible before, restored");
-    }
-
-    #[test]
-    fn focus_mode_round_trips_from_defaults() {
-        let mut ws = Workspace::new();
-
-        ws.toggle_focus_mode();
-        assert!(ws.focus_mode);
-
-        ws.toggle_focus_mode();
-        assert!(!ws.focus_mode);
-        assert!(ws.show_projects_pane);
-        assert!(ws.show_context_column);
+        let names: Vec<String> = entries.into_iter().map(|e| e.name).collect();
+        assert_eq!(names, ["src", "readme.md"]);
     }
 }
