@@ -12,7 +12,7 @@ use std::sync::mpsc::Receiver;
 use eframe::egui;
 
 use crate::layout::Layout;
-use crate::workspace::{spawn_scan, Entry, WorkspaceList};
+use crate::workspace::{spawn_scan, Node, WorkspaceList};
 
 /// The top-level MarkSpace application.
 pub struct MarkSpaceApp {
@@ -20,11 +20,11 @@ pub struct MarkSpaceApp {
     layout: Layout,
     /// Open workspaces, one active, shown in the Workspaces Pane.
     workspaces: WorkspaceList,
-    /// Top-level File Tree entries for the active workspace.
-    entries: Vec<Entry>,
+    /// Nested File Tree for the active workspace.
+    tree: Vec<Node>,
     /// Pending background scan; drained each frame until it delivers.
-    scan_rx: Option<Receiver<Vec<Entry>>>,
-    /// Which workspace root `entries`/`scan_rx` correspond to, so we rescan
+    scan_rx: Option<Receiver<Vec<Node>>>,
+    /// Which workspace root `tree`/`scan_rx` correspond to, so we rescan
     /// only when the active workspace changes.
     scanned_root: Option<PathBuf>,
 }
@@ -35,7 +35,7 @@ impl MarkSpaceApp {
         Self {
             layout: Layout::new(),
             workspaces: WorkspaceList::new(),
-            entries: Vec::new(),
+            tree: Vec::new(),
             scan_rx: None,
             scanned_root: None,
         }
@@ -57,7 +57,7 @@ impl MarkSpaceApp {
         let active_root = self.workspaces.active().map(|w| w.root.clone());
         if active_root != self.scanned_root {
             self.scanned_root = active_root.clone();
-            self.entries.clear();
+            self.tree.clear();
             self.scan_rx = active_root.map(spawn_scan);
         }
     }
@@ -66,8 +66,8 @@ impl MarkSpaceApp {
     fn drain_scan(&mut self, ctx: &egui::Context) {
         if let Some(rx) = &self.scan_rx {
             match rx.try_recv() {
-                Ok(entries) => {
-                    self.entries = entries;
+                Ok(tree) => {
+                    self.tree = tree;
                     self.scan_rx = None;
                 }
                 Err(_) => ctx.request_repaint(), // scan still running
@@ -127,6 +127,21 @@ impl MarkSpaceApp {
     }
 }
 
+/// Recursively render File Tree nodes: directories as collapsible headers
+/// (egui persists their open/closed state across frames, keyed by path), files
+/// as leaf labels.
+fn show_tree(ui: &mut egui::Ui, nodes: &[Node]) {
+    for node in nodes {
+        if node.is_dir {
+            egui::CollapsingHeader::new(format!("📁  {}", node.name))
+                .id_salt(&node.path)
+                .show(ui, |ui| show_tree(ui, &node.children));
+        } else {
+            ui.label(format!("📄  {}", node.name));
+        }
+    }
+}
+
 impl eframe::App for MarkSpaceApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // `ctx` is a cheap Arc handle; clone it so the immutable borrow of `ui`
@@ -163,10 +178,7 @@ impl eframe::App for MarkSpaceApp {
                             ui.label("Scanning…");
                         } else {
                             egui::ScrollArea::vertical().show(ui, |ui| {
-                                for entry in &self.entries {
-                                    let icon = if entry.is_dir { "📁" } else { "📄" };
-                                    ui.label(format!("{icon}  {}", entry.name));
-                                }
+                                show_tree(ui, &self.tree);
                             });
                         }
                     });
