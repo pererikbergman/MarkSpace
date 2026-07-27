@@ -3,6 +3,7 @@ mod config;
 mod file_tree;
 mod layout;
 mod live_tree;
+mod registry;
 mod scan;
 mod workspace;
 

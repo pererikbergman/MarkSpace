@@ -32,6 +32,13 @@ config's `[layout]` table (formerly the PRD's `[workspace]`/`[panels]`).
 The workspace currently selected in the Workspaces Pane, whose File Tree is
 shown. Recalled from the config's recent-workspace registry on startup.
 
+### Workspace registry
+The recent-workspace list together with its own persistence. Opening a
+workspace saves the config as a side effect and startup restores it, so no
+caller has to remember to persist. In code this is the `WorkspaceRegistry`
+type (`src/registry.rs`), composing the in-memory `WorkspaceList` with the
+`Config` file. Capped at 20, de-duplicated, most-recent order preserved.
+
 ### Panels
 The three top-level layout regions:
 
