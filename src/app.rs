@@ -5,10 +5,11 @@
 //! the three-panel layout. All logic lives in those types; this module only
 //! renders them and routes input. See `CONTEXT.md` for the vocabulary.
 
-use std::path::PathBuf;
-use std::sync::mpsc::Receiver;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
 
 use eframe::egui;
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::file_tree::FileTree;
 use crate::layout::Layout;
@@ -31,9 +32,19 @@ pub struct MarkSpaceApp {
     file_tree: FileTree,
     /// Pending background scan; drained each frame until it delivers.
     scan_rx: Option<Receiver<Vec<Node>>>,
+    /// Whether the pending scan is a live refresh (preserve expand/selection)
+    /// rather than an initial load (reset state).
+    scan_is_refresh: bool,
     /// Which workspace root the current `file_tree`/`scan_rx` correspond to, so
     /// we rescan only when the active workspace changes.
     scanned_root: Option<PathBuf>,
+    /// Filesystem watcher on the active workspace root; kept alive here so
+    /// dropping/replacing it re-points watching when the workspace changes.
+    watcher: Option<RecommendedWatcher>,
+    /// Signals from the watcher that the workspace changed on disk.
+    watch_rx: Option<Receiver<()>>,
+    /// A filesystem change is pending a rescan (coalesces event bursts).
+    dirty: bool,
     /// Which pane the arrow keys drive.
     focus: FocusPane,
 }
@@ -57,7 +68,11 @@ impl MarkSpaceApp {
             workspaces: WorkspaceList::new(),
             file_tree: FileTree::new(Vec::new()),
             scan_rx: None,
+            scan_is_refresh: false,
             scanned_root: None,
+            watcher: None,
+            watch_rx: None,
+            dirty: false,
             focus: FocusPane::Files,
         }
     }
@@ -110,13 +125,54 @@ impl MarkSpaceApp {
         }
     }
 
-    /// Start a fresh background scan whenever the active workspace changes.
-    fn sync_active_scan(&mut self) {
+    /// When the active workspace changes, reset the tree, kick off an initial
+    /// scan, and re-point the filesystem watcher (dropping the old one).
+    fn sync_active_workspace(&mut self, ctx: &egui::Context) {
         let active_root = self.workspaces.active().map(|w| w.root.clone());
-        if active_root != self.scanned_root {
-            self.scanned_root = active_root.clone();
-            self.file_tree = FileTree::new(Vec::new());
-            self.scan_rx = active_root.map(spawn_scan);
+        if active_root == self.scanned_root {
+            return;
+        }
+        self.scanned_root = active_root.clone();
+        self.file_tree = FileTree::new(Vec::new());
+        self.dirty = false;
+
+        match active_root {
+            Some(root) => {
+                self.scan_is_refresh = false;
+                self.scan_rx = Some(spawn_scan(root.clone()));
+                match spawn_watch(&root, ctx.clone()) {
+                    Some((watcher, rx)) => {
+                        self.watcher = Some(watcher);
+                        self.watch_rx = Some(rx);
+                    }
+                    None => {
+                        self.watcher = None;
+                        self.watch_rx = None;
+                    }
+                }
+            }
+            None => {
+                self.scan_rx = None;
+                self.watcher = None;
+                self.watch_rx = None;
+            }
+        }
+    }
+
+    /// Drain watcher signals and, once idle, coalesce them into a single live
+    /// rescan of the active workspace.
+    fn poll_watch(&mut self) {
+        if let Some(rx) = &self.watch_rx {
+            while rx.try_recv().is_ok() {
+                self.dirty = true;
+            }
+        }
+        if self.dirty && self.scan_rx.is_none() {
+            if let Some(root) = self.scanned_root.clone() {
+                self.scan_is_refresh = true;
+                self.scan_rx = Some(spawn_scan(root));
+            }
+            self.dirty = false;
         }
     }
 
@@ -125,7 +181,11 @@ impl MarkSpaceApp {
         if let Some(rx) = &self.scan_rx {
             match rx.try_recv() {
                 Ok(tree) => {
-                    self.file_tree = FileTree::new(tree);
+                    if self.scan_is_refresh {
+                        self.file_tree.update_roots(tree); // live refresh: keep state
+                    } else {
+                        self.file_tree = FileTree::new(tree); // initial load: reset
+                    }
                     self.scan_rx = None;
                 }
                 Err(_) => ctx.request_repaint(), // scan still running
@@ -201,7 +261,8 @@ impl eframe::App for MarkSpaceApp {
         self.handle_shortcuts(&ctx);
         self.handle_drops(&ctx);
         self.handle_navigation(&ctx);
-        self.sync_active_scan();
+        self.sync_active_workspace(&ctx);
+        self.poll_watch();
         self.drain_scan(&ctx);
 
         // Panel A: far-left workspaces pane.
@@ -278,6 +339,23 @@ impl eframe::App for MarkSpaceApp {
             ui.label("Editor canvas — WYSIWYG engine lands in Phase 4.");
         });
     }
+}
+
+/// Start a recursive filesystem watcher on `root`. Each change sends a signal
+/// over the channel and requests a repaint so the UI wakes to rescan. Returns
+/// the watcher (which must be kept alive) and the receiver, or `None` if the
+/// watcher couldn't be created. Non-UI I/O, verified by running.
+fn spawn_watch(root: &Path, ctx: egui::Context) -> Option<(RecommendedWatcher, Receiver<()>)> {
+    let (tx, rx) = mpsc::channel();
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if res.is_ok() {
+            let _ = tx.send(());
+            ctx.request_repaint();
+        }
+    })
+    .ok()?;
+    watcher.watch(root, RecursiveMode::Recursive).ok()?;
+    Some((watcher, rx))
 }
 
 /// Render one File Tree row as a full-width, left-aligned, indented selectable
