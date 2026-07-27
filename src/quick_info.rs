@@ -32,6 +32,19 @@ impl QuickInfo {
     }
 }
 
+/// Whether the file on disk differs from a cached [`QuickInfo`] (size or
+/// modified time), warranting a recompute. `true` if nothing is cached or the
+/// file can't be read. A cheap stat — no content read.
+pub fn file_changed(cached: Option<&QuickInfo>, file: &Path) -> bool {
+    let Some(cached) = cached else {
+        return true;
+    };
+    match std::fs::metadata(file) {
+        Ok(meta) => meta.len() != cached.size || meta.modified().ok() != cached.modified,
+        Err(_) => true,
+    }
+}
+
 /// Word, character, and line counts of a file's text.
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub struct Counts {
@@ -167,6 +180,28 @@ mod tests {
         let bin_info = QuickInfo::read(&bin, root.path()).unwrap();
         assert_eq!(bin_info.size, 3, "metadata still available");
         assert_eq!(bin_info.counts, None, "unreadable-as-text → counts unknown");
+    }
+
+    #[test]
+    fn file_changed_detects_size_and_missing_cache() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        let root = tempdir().unwrap();
+        let f = root.path().join("a.md");
+        fs::write(&f, "hi").unwrap();
+        let cached = QuickInfo::read(&f, root.path()).unwrap();
+
+        assert!(!file_changed(Some(&cached), &f), "unchanged file");
+
+        fs::write(&f, "hello world").unwrap(); // size 2 -> 11
+        assert!(file_changed(Some(&cached), &f), "size changed");
+
+        assert!(file_changed(None, &f), "nothing cached yet");
+        assert!(
+            file_changed(Some(&cached), &root.path().join("gone.md")),
+            "unreadable file"
+        );
     }
 
     #[test]

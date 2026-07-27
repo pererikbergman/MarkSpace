@@ -81,8 +81,9 @@ impl LiveTree {
     }
 
     /// Advance the lifecycle one frame: absorb watcher signals, launch a
-    /// coalesced refresh if due, and apply a delivered scan.
-    pub fn poll(&mut self) {
+    /// coalesced refresh if due, and apply a delivered scan. Returns `true` on
+    /// the frame a scan is applied (a pulse that the tree has changed on disk).
+    pub fn poll(&mut self) -> bool {
         if let Some(rx) = &self.watch_rx {
             while rx.try_recv().is_ok() {
                 self.state.mark_dirty();
@@ -96,6 +97,7 @@ impl LiveTree {
             self.start_scan(root, kind);
         }
 
+        let mut delivered = false;
         if let Some(rx) = &self.scan_rx {
             match rx.try_recv() {
                 Ok(nodes) => {
@@ -107,10 +109,12 @@ impl LiveTree {
                     self.scan_rx = None;
                     self.scan_kind = None;
                     self.state.scan_finished();
+                    delivered = true;
                 }
                 Err(_) => (self.on_change)(), // keep waking until the scan lands
             }
         }
+        delivered
     }
 
     /// The current File Tree (read-only).
