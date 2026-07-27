@@ -67,9 +67,26 @@ Stored as `layout.focus_mode`.
 
 ### WYSIWYG rendering
 The editor's live-rendering behaviour: raw markdown syntax (`#`, `**`, `>`, …)
-is **hidden** when the caret leaves a line block and **re-exposed** when the
-caret enters it. Driven by caret-position token matching over `pulldown-cmark`
-events.
+is **hidden** when the caret leaves a **block** and **re-exposed** when the
+caret enters it. Realised as per-block live preview (see **Block**, **Active
+block**), driven by `pulldown-cmark`.
+
+### Document source
+The active file's full markdown text held in the editor — the single source of
+truth for editing. **Blocks** are byte-range spans into it; editing splices a
+block's new text back into the source and re-parses. Saving writes the source.
+
+### Block
+One editable unit of the Document source — a markdown block-level element
+(heading, paragraph, blockquote, fenced code block, list item, …), identified
+by its byte-range span. Each block renders either as styled markdown (syntax
+hidden) or, when it's the **active block**, as its raw source.
+
+### Active block
+The single block containing the caret. It renders as raw, editable markdown
+(syntax shown); every other block renders as styled markdown with syntax
+hidden. Moving the caret out of a block re-renders it; entering a block makes
+it active.
 
 ### Active file
 The single markdown document currently open in the Editor Canvas, selected in
