@@ -2,50 +2,63 @@
 //!
 //! This is thin glue: every frame it wires keyboard shortcuts to [`Layout`]
 //! toggle methods, then draws the three-panel layout based on the resulting
-//! state. All layout *logic* lives in [`Layout`]; this module only renders it.
-//! See `CONTEXT.md` for the panel vocabulary.
+//! state. All layout *logic* lives in [`Layout`] and workspace logic in
+//! [`WorkspaceList`]; this module only renders them. See `CONTEXT.md` for the
+//! panel vocabulary.
 
+use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
 use eframe::egui;
 
 use crate::layout::Layout;
-use crate::workspace::{spawn_scan, Entry, Workspace};
+use crate::workspace::{spawn_scan, Entry, WorkspaceList};
 
 /// The top-level MarkSpace application.
 pub struct MarkSpaceApp {
     /// Panel visibility / focus-mode state.
     layout: Layout,
-    /// The currently open workspace (an opened folder), if any.
-    workspace: Option<Workspace>,
-    /// Top-level entries shown in the File Tree.
+    /// Open workspaces, one active, shown in the Workspaces Pane.
+    workspaces: WorkspaceList,
+    /// Top-level File Tree entries for the active workspace.
     entries: Vec<Entry>,
     /// Pending background scan; drained each frame until it delivers.
     scan_rx: Option<Receiver<Vec<Entry>>>,
+    /// Which workspace root `entries`/`scan_rx` correspond to, so we rescan
+    /// only when the active workspace changes.
+    scanned_root: Option<PathBuf>,
 }
 
 impl MarkSpaceApp {
-    /// Build the app with a default layout and no workspace open.
+    /// Build the app with a default layout and no workspaces open.
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         Self {
             layout: Layout::new(),
-            workspace: None,
+            workspaces: WorkspaceList::new(),
             entries: Vec::new(),
             scan_rx: None,
+            scanned_root: None,
         }
     }
 
-    /// If the user dropped a folder onto the window, open it as the active
-    /// workspace and start a background scan. Non-directory drops are ignored.
+    /// Open a folder dropped anywhere on the window as a workspace. macOS/winit
+    /// doesn't report *where* an external file-drop landed, so we can't scope
+    /// the drop to the Workspaces Pane; a drop always means "add a workspace".
+    /// Non-directory drops are ignored by `WorkspaceList::open`.
     fn handle_drops(&mut self, ctx: &egui::Context) {
         let dropped = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
+        if let Some(path) = dropped {
+            self.workspaces.open(path);
+        }
+    }
 
-        if let Some(path) = dropped
-            && let Some(workspace) = Workspace::open(path)
-        {
-            self.scan_rx = Some(spawn_scan(workspace.root.clone()));
+    /// Start a fresh background scan whenever the active workspace changes.
+    fn sync_active_scan(&mut self) {
+        let active_root = self.workspaces.active().map(|w| w.root.clone());
+        if active_root != self.scanned_root {
+            self.scanned_root = active_root.clone();
             self.entries.clear();
-            self.workspace = Some(workspace);
+            self.scan_rx = active_root.map(spawn_scan);
         }
     }
 
@@ -84,6 +97,34 @@ impl MarkSpaceApp {
             self.layout.toggle_focus_mode();
         }
     }
+
+    /// Draw the far-left Workspaces Pane: a clickable list of open workspaces
+    /// with the active one highlighted.
+    fn show_workspaces_pane(&mut self, ui: &mut egui::Ui) {
+        let active_index = self.workspaces.active_index();
+        let names: Vec<String> = self.workspaces.iter().map(|w| w.name()).collect();
+        let mut clicked = None;
+
+        egui::Panel::left("workspaces_pane")
+            .default_size(180.0)
+            .show(ui, |ui| {
+                ui.heading("Workspaces");
+                ui.separator();
+                if names.is_empty() {
+                    ui.label("(drop a folder to open a workspace)");
+                } else {
+                    for (i, name) in names.iter().enumerate() {
+                        if ui.selectable_label(Some(i) == active_index, name).clicked() {
+                            clicked = Some(i);
+                        }
+                    }
+                }
+            });
+
+        if let Some(i) = clicked {
+            self.workspaces.select(i);
+        }
+    }
 }
 
 impl eframe::App for MarkSpaceApp {
@@ -93,17 +134,12 @@ impl eframe::App for MarkSpaceApp {
         let ctx = ui.ctx().clone();
         self.handle_shortcuts(&ctx);
         self.handle_drops(&ctx);
+        self.sync_active_scan();
         self.drain_scan(&ctx);
 
         // Panel A: far-left workspaces pane.
         if self.layout.show_workspaces_pane {
-            egui::Panel::left("workspaces_pane")
-                .default_size(180.0)
-                .show(ui, |ui| {
-                    ui.heading("Workspaces");
-                    ui.separator();
-                    ui.label("(no workspaces open)");
-                });
+            self.show_workspaces_pane(ui);
         }
 
         // Panel C: far-right context column — file tree over quick info.
@@ -121,21 +157,17 @@ impl eframe::App for MarkSpaceApp {
                     }
                     egui::CentralPanel::default().show(ui, |ui| {
                         ui.heading("File Tree");
-                        match &self.workspace {
-                            None => {
-                                ui.label("(drop a folder here to open a workspace)");
-                            }
-                            Some(_) if self.scan_rx.is_some() => {
-                                ui.label("Scanning…");
-                            }
-                            Some(_) => {
-                                egui::ScrollArea::vertical().show(ui, |ui| {
-                                    for entry in &self.entries {
-                                        let icon = if entry.is_dir { "📁" } else { "📄" };
-                                        ui.label(format!("{icon}  {}", entry.name));
-                                    }
-                                });
-                            }
+                        if self.workspaces.active().is_none() {
+                            ui.label("(no workspace open)");
+                        } else if self.scan_rx.is_some() {
+                            ui.label("Scanning…");
+                        } else {
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                for entry in &self.entries {
+                                    let icon = if entry.is_dir { "📁" } else { "📄" };
+                                    ui.label(format!("{icon}  {}", entry.name));
+                                }
+                            });
                         }
                     });
                 });

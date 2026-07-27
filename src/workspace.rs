@@ -24,6 +24,79 @@ impl Workspace {
     pub fn open(path: PathBuf) -> Option<Workspace> {
         path.is_dir().then_some(Workspace { root: path })
     }
+
+    /// Display name for the Workspaces Pane: the root's final path component,
+    /// falling back to the full path (e.g. for a filesystem root).
+    pub fn name(&self) -> String {
+        self.root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.root.to_string_lossy().into_owned())
+    }
+}
+
+/// The set of open workspaces, cmux-style, with one selected as active.
+pub struct WorkspaceList {
+    items: Vec<Workspace>,
+    active: Option<usize>,
+}
+
+impl WorkspaceList {
+    /// An empty list with no active workspace.
+    pub fn new() -> Self {
+        Self {
+            items: Vec::new(),
+            active: None,
+        }
+    }
+
+    /// Open `path` as a workspace: validate it's a directory, add it, and make
+    /// it active. Returns `false` (and changes nothing) for a non-directory.
+    pub fn open(&mut self, path: PathBuf) -> bool {
+        match Workspace::open(path) {
+            Some(workspace) => {
+                let index = self
+                    .items
+                    .iter()
+                    .position(|w| w.root == workspace.root)
+                    .unwrap_or_else(|| {
+                        self.items.push(workspace);
+                        self.items.len() - 1
+                    });
+                self.active = Some(index);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Make the workspace at `index` active. Out-of-range indices are ignored.
+    pub fn select(&mut self, index: usize) {
+        if index < self.items.len() {
+            self.active = Some(index);
+        }
+    }
+
+    /// The currently active workspace, if any.
+    pub fn active(&self) -> Option<&Workspace> {
+        self.active.map(|i| &self.items[i])
+    }
+
+    /// Index of the active workspace, for rendering selection in the pane.
+    pub fn active_index(&self) -> Option<usize> {
+        self.active
+    }
+
+    /// Iterate the open workspaces in insertion order.
+    pub fn iter(&self) -> impl Iterator<Item = &Workspace> {
+        self.items.iter()
+    }
+}
+
+impl Default for WorkspaceList {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// One top-level item shown in the File Tree.
@@ -141,6 +214,82 @@ mod tests {
             Workspace::open(dir.path().join("nope")).is_none(),
             "a missing path is not a workspace"
         );
+    }
+
+    #[test]
+    fn new_workspace_list_is_empty_with_no_active() {
+        let list = WorkspaceList::new();
+        assert!(list.active().is_none());
+        assert_eq!(list.iter().count(), 0);
+    }
+
+    #[test]
+    fn open_adds_a_directory_and_makes_it_active() {
+        let dir = tempdir().unwrap();
+        let mut list = WorkspaceList::new();
+
+        let opened = list.open(dir.path().to_path_buf());
+
+        assert!(opened);
+        assert_eq!(list.iter().count(), 1);
+        assert_eq!(list.active().map(|w| &w.root), Some(&dir.path().to_path_buf()));
+    }
+
+    #[test]
+    fn open_rejects_a_non_directory_and_leaves_the_list_unchanged() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("note.md");
+        fs::write(&file, "").unwrap();
+        let mut list = WorkspaceList::new();
+
+        let opened = list.open(file);
+
+        assert!(!opened);
+        assert_eq!(list.iter().count(), 0);
+        assert!(list.active().is_none());
+    }
+
+    #[test]
+    fn open_does_not_duplicate_an_already_open_workspace() {
+        let a = tempdir().unwrap();
+        let b = tempdir().unwrap();
+        let mut list = WorkspaceList::new();
+
+        list.open(a.path().to_path_buf()); // active = a
+        list.open(b.path().to_path_buf()); // active = b
+        let reopened = list.open(a.path().to_path_buf()); // already open
+
+        assert!(reopened);
+        assert_eq!(list.iter().count(), 2, "no duplicate entry");
+        assert_eq!(
+            list.active().map(|w| &w.root),
+            Some(&a.path().to_path_buf()),
+            "reopening selects the existing workspace"
+        );
+    }
+
+    #[test]
+    fn name_is_the_final_path_component() {
+        let dir = tempdir().unwrap();
+        let sub = dir.path().join("my-notes");
+        fs::create_dir(&sub).unwrap();
+
+        let workspace = Workspace::open(sub).unwrap();
+
+        assert_eq!(workspace.name(), "my-notes");
+    }
+
+    #[test]
+    fn select_changes_the_active_workspace() {
+        let a = tempdir().unwrap();
+        let b = tempdir().unwrap();
+        let mut list = WorkspaceList::new();
+        list.open(a.path().to_path_buf());
+        list.open(b.path().to_path_buf()); // active = b (index 1)
+
+        list.select(0);
+
+        assert_eq!(list.active().map(|w| &w.root), Some(&a.path().to_path_buf()));
     }
 
     #[test]
