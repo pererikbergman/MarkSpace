@@ -8,7 +8,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use crate::workspace::Node;
+use crate::scan::Node;
 
 /// A visible row in the rendered File Tree: a node at a given indent `depth`,
 /// with `expanded` telling the renderer which triangle to draw for a directory.

@@ -14,7 +14,8 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use crate::config::Config;
 use crate::file_tree::FileTree;
 use crate::layout::Layout;
-use crate::workspace::{spawn_scan, Node, WorkspaceList};
+use crate::scan::{spawn_scan, Node};
+use crate::workspace::WorkspaceList;
 
 /// Which pane the arrow keys currently drive.
 #[derive(PartialEq, Clone, Copy)]
