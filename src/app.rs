@@ -9,10 +9,9 @@ use std::path::PathBuf;
 
 use eframe::egui;
 
-use crate::config::Config;
 use crate::layout::Layout;
 use crate::live_tree::LiveTree;
-use crate::workspace::WorkspaceList;
+use crate::registry::WorkspaceRegistry;
 
 /// Which pane the arrow keys currently drive.
 #[derive(PartialEq, Clone, Copy)]
@@ -25,12 +24,10 @@ enum FocusPane {
 pub struct MarkSpaceApp {
     /// Panel visibility / focus-mode state.
     layout: Layout,
-    /// Open workspaces, one active, shown in the Workspaces Pane.
-    workspaces: WorkspaceList,
+    /// Recent workspaces (one active), self-persisting; shown in the pane.
+    workspaces: WorkspaceRegistry,
     /// The active workspace's File Tree, kept live with the filesystem.
     live_tree: LiveTree,
-    /// Where the recent-workspace registry is persisted, if a home dir exists.
-    config_path: Option<PathBuf>,
     /// Which pane the arrow keys drive.
     focus: FocusPane,
 }
@@ -49,45 +46,27 @@ struct FileRow {
 impl MarkSpaceApp {
     /// Build the app, restoring the recent-workspace registry from config.
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let config_path = default_config_path();
-        let workspaces = match &config_path {
-            Some(path) => WorkspaceList::from_paths(Config::load(path).workspaces),
-            None => WorkspaceList::new(),
-        };
-
         // Repaint the UI when the live tree wants attention (scan done, fs event).
         let ctx = cc.egui_ctx.clone();
         let live_tree = LiveTree::new(move || ctx.request_repaint());
 
         Self {
             layout: Layout::new(),
-            workspaces,
+            workspaces: WorkspaceRegistry::load(),
             live_tree,
-            config_path,
             focus: FocusPane::Files,
-        }
-    }
-
-    /// Persist the current recent-workspace registry (best-effort).
-    fn save_config(&self) {
-        if let Some(path) = &self.config_path {
-            let config = Config {
-                workspaces: self.workspaces.paths(),
-            };
-            let _ = config.save(path);
         }
     }
 
     /// Open a folder dropped anywhere on the window as a workspace. macOS/winit
     /// doesn't report *where* an external file-drop landed, so we can't scope
     /// the drop to the Workspaces Pane (ADR 0003); a drop always adds a
-    /// workspace. Non-directory drops are ignored by `WorkspaceList::open`.
-    /// Returns whether a workspace was opened (so the caller can persist).
-    fn handle_drops(&mut self, ctx: &egui::Context) -> bool {
+    /// workspace. Non-directory drops are ignored, and the registry persists
+    /// itself.
+    fn handle_drops(&mut self, ctx: &egui::Context) {
         let dropped = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
-        match dropped {
-            Some(path) => self.workspaces.open(path),
-            None => false,
+        if let Some(path) = dropped {
+            self.workspaces.open(path);
         }
     }
 
@@ -195,9 +174,7 @@ impl eframe::App for MarkSpaceApp {
         // ends before we draw into `ui` below.
         let ctx = ui.ctx().clone();
         self.handle_shortcuts(&ctx);
-        if self.handle_drops(&ctx) {
-            self.save_config();
-        }
+        self.handle_drops(&ctx);
         self.handle_navigation(&ctx);
 
         // Keep the live tree pointed at the active workspace and advance it.
@@ -281,12 +258,6 @@ impl eframe::App for MarkSpaceApp {
             ui.label("Editor canvas — WYSIWYG engine lands in Phase 4.");
         });
     }
-}
-
-/// The config location per the PRD: `~/.config/markspace/config.toml` (note:
-/// explicitly `~/.config`, even on macOS). `None` if there's no home dir.
-fn default_config_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".config/markspace/config.toml"))
 }
 
 /// Render one File Tree row as a full-width, left-aligned, indented selectable
