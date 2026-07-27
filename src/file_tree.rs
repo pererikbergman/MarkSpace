@@ -41,6 +41,14 @@ impl FileTree {
         self.selected.as_deref()
     }
 
+    /// The selected node's path *only if it's a file* — i.e. the active file.
+    /// A selected directory (or no selection) yields `None`.
+    pub fn selected_file(&self) -> Option<&Path> {
+        let selected = self.selected.as_deref()?;
+        let node = find_node(&self.roots, selected)?;
+        (!node.is_dir).then_some(node.path.as_path())
+    }
+
     /// Whether a directory is currently expanded.
     pub fn is_expanded(&self, path: &Path) -> bool {
         self.expanded.contains(path)
@@ -253,6 +261,22 @@ mod tests {
         tree.select(PathBuf::from("/w/readme.md"));
 
         assert_eq!(tree.selected(), Some(Path::new("/w/readme.md")));
+    }
+
+    #[test]
+    fn selected_file_is_the_selection_only_when_it_is_a_file() {
+        let mut tree = FileTree::new(vec![
+            dir("/w/src", vec![file("/w/src/main.rs")]),
+            file("/w/readme.md"),
+        ]);
+
+        assert_eq!(tree.selected_file(), None, "nothing selected");
+
+        tree.select(PathBuf::from("/w/readme.md"));
+        assert_eq!(tree.selected_file(), Some(Path::new("/w/readme.md")));
+
+        tree.select(PathBuf::from("/w/src"));
+        assert_eq!(tree.selected_file(), None, "a directory is not the active file");
     }
 
     #[test]
