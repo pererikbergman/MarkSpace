@@ -5,12 +5,14 @@
 //! the three-panel layout. All logic lives in those types; this module only
 //! renders them and routes input. See `CONTEXT.md` for the vocabulary.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use eframe::egui;
 
 use crate::layout::Layout;
 use crate::live_tree::LiveTree;
+use crate::quick_info::{format_age, format_size, QuickInfo};
 use crate::registry::WorkspaceRegistry;
 
 /// Which pane the arrow keys currently drive.
@@ -28,6 +30,10 @@ pub struct MarkSpaceApp {
     workspaces: WorkspaceRegistry,
     /// The active workspace's File Tree, kept live with the filesystem.
     live_tree: LiveTree,
+    /// Cached Quick Info for the active file, recomputed when it changes.
+    quick_info: Option<QuickInfo>,
+    /// The path `quick_info` was computed for (to detect active-file changes).
+    quick_info_path: Option<PathBuf>,
     /// Which pane the arrow keys drive.
     focus: FocusPane,
 }
@@ -54,8 +60,24 @@ impl MarkSpaceApp {
             layout: Layout::new(),
             workspaces: WorkspaceRegistry::load(),
             live_tree,
+            quick_info: None,
+            quick_info_path: None,
             focus: FocusPane::Files,
         }
+    }
+
+    /// Recompute the active file's Quick Info when the active file changes.
+    fn sync_quick_info(&mut self) {
+        let active_file = self.live_tree.tree().selected_file().map(Path::to_path_buf);
+        if active_file == self.quick_info_path {
+            return;
+        }
+        self.quick_info_path = active_file.clone();
+        let root = self.workspaces.active().map(|w| w.root.clone());
+        self.quick_info = match (active_file, root) {
+            (Some(file), Some(root)) => QuickInfo::read(&file, &root),
+            _ => None,
+        };
     }
 
     /// Open a folder dropped anywhere on the window as a workspace. macOS/winit
@@ -181,6 +203,7 @@ impl eframe::App for MarkSpaceApp {
         self.live_tree
             .set_root(self.workspaces.active().map(|w| w.root.clone()));
         self.live_tree.poll();
+        self.sync_quick_info();
 
         // Panel A: far-left workspaces pane.
         if self.layout.show_workspaces_pane {
@@ -219,7 +242,23 @@ impl eframe::App for MarkSpaceApp {
                             .resizable(false)
                             .show(ui, |ui| {
                                 ui.heading("Quick Info");
-                                ui.label("Words: — · Lines: — · Size: — · Modified: —");
+                                match &self.quick_info {
+                                    Some(info) => {
+                                        ui.label(format!("Path: {}", info.relative_path));
+                                        ui.label(format!("Size: {}", format_size(info.size)));
+                                        let modified = info
+                                            .modified
+                                            .and_then(|m| SystemTime::now().duration_since(m).ok())
+                                            .map(format_age)
+                                            .unwrap_or_else(|| "—".to_string());
+                                        ui.label(format!("Modified: {modified}"));
+                                        // Word/char/line counts arrive in #18.
+                                        ui.label("Words: — · Chars: — · Lines: —");
+                                    }
+                                    None => {
+                                        ui.label("(no file selected)");
+                                    }
+                                }
                             });
                     }
                     egui::CentralPanel::default().show(ui, |ui| {
