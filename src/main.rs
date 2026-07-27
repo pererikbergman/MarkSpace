@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod file_tree;
 mod layout;
+mod scan;
 mod workspace;
 
 use app::MarkSpaceApp;
