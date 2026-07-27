@@ -13,18 +13,41 @@ pub struct QuickInfo {
     pub size: u64,
     pub modified: Option<SystemTime>,
     pub relative_path: String,
+    /// Content counts, or `None` if the file couldn't be read as text.
+    pub counts: Option<Counts>,
 }
 
 impl QuickInfo {
-    /// Read the file's metadata, with its path shown relative to
-    /// `workspace_root`. `None` if the file can't be read.
+    /// Read the file's metadata and content counts, with its path shown
+    /// relative to `workspace_root`. `None` if the file's metadata can't be
+    /// read; `counts` is `None` if the content isn't readable as text.
     pub fn read(file: &Path, workspace_root: &Path) -> Option<QuickInfo> {
         let meta = std::fs::metadata(file).ok()?;
         Some(QuickInfo {
             size: meta.len(),
             modified: meta.modified().ok(),
             relative_path: relative_path(file, workspace_root),
+            counts: std::fs::read_to_string(file).ok().map(|text| count_text(&text)),
         })
+    }
+}
+
+/// Word, character, and line counts of a file's text.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub struct Counts {
+    pub words: usize,
+    pub chars: usize,
+    pub lines: usize,
+}
+
+/// Count words (whitespace-separated), characters (Unicode scalar values), and
+/// lines in `text`. A trailing newline does not add a phantom line, and an
+/// empty string is all zeros.
+pub fn count_text(text: &str) -> Counts {
+    Counts {
+        words: text.split_whitespace().count(),
+        chars: text.chars().count(),
+        lines: text.lines().count(),
     }
 }
 
@@ -73,6 +96,35 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn count_text_counts_words_chars_and_lines() {
+        let counts = count_text("hello world\nfoo bar baz\n");
+        assert_eq!(counts.words, 5);
+        assert_eq!(counts.lines, 2);
+        assert_eq!(counts.chars, 24);
+    }
+
+    #[test]
+    fn count_text_of_empty_is_all_zeros() {
+        assert_eq!(
+            count_text(""),
+            Counts { words: 0, chars: 0, lines: 0 }
+        );
+    }
+
+    #[test]
+    fn count_text_trailing_newline_adds_no_phantom_line() {
+        assert_eq!(count_text("a\nb\n").lines, 2);
+        assert_eq!(count_text("a\nb").lines, 2);
+    }
+
+    #[test]
+    fn count_text_counts_unicode_scalar_chars() {
+        let counts = count_text("café");
+        assert_eq!(counts.chars, 4);
+        assert_eq!(counts.words, 1);
+    }
+
+    #[test]
     fn format_size_scales_by_unit() {
         assert_eq!(format_size(512), "512 B");
         assert_eq!(format_size(1536), "1.5 KB");
@@ -96,6 +148,25 @@ mod tests {
         assert_eq!(info.size, 5);
         assert_eq!(info.relative_path, "notes/a.md");
         assert!(info.modified.is_some());
+    }
+
+    #[test]
+    fn read_includes_counts_for_text_and_none_for_binary() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        let root = tempdir().unwrap();
+
+        let text = root.path().join("a.md");
+        fs::write(&text, "one two\n").unwrap(); // 2 words, 8 chars, 1 line
+        let info = QuickInfo::read(&text, root.path()).unwrap();
+        assert_eq!(info.counts, Some(Counts { words: 2, chars: 8, lines: 1 }));
+
+        let bin = root.path().join("b.bin");
+        fs::write(&bin, [0xFF, 0xFE, 0x00]).unwrap(); // invalid UTF-8
+        let bin_info = QuickInfo::read(&bin, root.path()).unwrap();
+        assert_eq!(bin_info.size, 3, "metadata still available");
+        assert_eq!(bin_info.counts, None, "unreadable-as-text → counts unknown");
     }
 
     #[test]

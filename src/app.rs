@@ -252,8 +252,13 @@ impl eframe::App for MarkSpaceApp {
                                             .map(format_age)
                                             .unwrap_or_else(|| "—".to_string());
                                         ui.label(format!("Modified: {modified}"));
-                                        // Word/char/line counts arrive in #18.
-                                        ui.label("Words: — · Chars: — · Lines: —");
+                                        match &info.counts {
+                                            Some(c) => ui.label(format!(
+                                                "Words: {} · Chars: {} · Lines: {}",
+                                                c.words, c.chars, c.lines
+                                            )),
+                                            None => ui.label("Words: — · Chars: — · Lines: —"),
+                                        };
                                     }
                                     None => {
                                         ui.label("(no file selected)");
