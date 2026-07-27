@@ -1,29 +1,82 @@
 //! The eframe application shell for MarkSpace.
 //!
-//! This is thin glue: every frame it wires keyboard shortcuts to
-//! [`Workspace`] toggle methods, then draws the three-panel layout based on the
-//! resulting state. All layout *logic* lives in [`Workspace`]; this module only
-//! renders it. See `CONTEXT.md` for the panel vocabulary.
+//! This is thin glue: every frame it wires keyboard shortcuts to [`Layout`]
+//! toggle methods, then draws the three-panel layout based on the resulting
+//! state. All layout *logic* lives in [`Layout`] and workspace logic in
+//! [`WorkspaceList`]; this module only renders them. See `CONTEXT.md` for the
+//! panel vocabulary.
+
+use std::path::PathBuf;
+use std::sync::mpsc::Receiver;
 
 use eframe::egui;
 
-use crate::workspace::Workspace;
+use crate::layout::Layout;
+use crate::workspace::{spawn_scan, Entry, WorkspaceList};
 
 /// The top-level MarkSpace application.
 pub struct MarkSpaceApp {
-    workspace: Workspace,
+    /// Panel visibility / focus-mode state.
+    layout: Layout,
+    /// Open workspaces, one active, shown in the Workspaces Pane.
+    workspaces: WorkspaceList,
+    /// Top-level File Tree entries for the active workspace.
+    entries: Vec<Entry>,
+    /// Pending background scan; drained each frame until it delivers.
+    scan_rx: Option<Receiver<Vec<Entry>>>,
+    /// Which workspace root `entries`/`scan_rx` correspond to, so we rescan
+    /// only when the active workspace changes.
+    scanned_root: Option<PathBuf>,
 }
 
 impl MarkSpaceApp {
-    /// Build the app with a default workspace.
+    /// Build the app with a default layout and no workspaces open.
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         Self {
-            workspace: Workspace::new(),
+            layout: Layout::new(),
+            workspaces: WorkspaceList::new(),
+            entries: Vec::new(),
+            scan_rx: None,
+            scanned_root: None,
         }
     }
 
-    /// Map the PRD's layout shortcuts to workspace toggles. `COMMAND` resolves
-    /// to Cmd on macOS and Ctrl elsewhere, matching the PRD's `Cmd/Ctrl`.
+    /// Open a folder dropped anywhere on the window as a workspace. macOS/winit
+    /// doesn't report *where* an external file-drop landed, so we can't scope
+    /// the drop to the Workspaces Pane; a drop always means "add a workspace".
+    /// Non-directory drops are ignored by `WorkspaceList::open`.
+    fn handle_drops(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
+        if let Some(path) = dropped {
+            self.workspaces.open(path);
+        }
+    }
+
+    /// Start a fresh background scan whenever the active workspace changes.
+    fn sync_active_scan(&mut self) {
+        let active_root = self.workspaces.active().map(|w| w.root.clone());
+        if active_root != self.scanned_root {
+            self.scanned_root = active_root.clone();
+            self.entries.clear();
+            self.scan_rx = active_root.map(spawn_scan);
+        }
+    }
+
+    /// Drain a pending background scan; keep repainting until it arrives.
+    fn drain_scan(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.scan_rx {
+            match rx.try_recv() {
+                Ok(entries) => {
+                    self.entries = entries;
+                    self.scan_rx = None;
+                }
+                Err(_) => ctx.request_repaint(), // scan still running
+            }
+        }
+    }
+
+    /// Map the PRD's layout shortcuts to panel toggles. `COMMAND` resolves to
+    /// Cmd on macOS and Ctrl elsewhere, matching the PRD's `Cmd/Ctrl`.
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         use egui::{Key, KeyboardShortcut, Modifiers};
 
@@ -32,16 +85,44 @@ impl MarkSpaceApp {
         };
 
         if pressed(Modifiers::COMMAND, Key::Num1) {
-            self.workspace.toggle_projects_pane();
+            self.layout.toggle_workspaces_pane();
         }
         if pressed(Modifiers::COMMAND, Key::Num2) {
-            self.workspace.toggle_context_column();
+            self.layout.toggle_context_column();
         }
         if pressed(Modifiers::COMMAND, Key::I) {
-            self.workspace.toggle_quick_info();
+            self.layout.toggle_quick_info();
         }
         if pressed(Modifiers::COMMAND | Modifiers::SHIFT, Key::F) {
-            self.workspace.toggle_focus_mode();
+            self.layout.toggle_focus_mode();
+        }
+    }
+
+    /// Draw the far-left Workspaces Pane: a clickable list of open workspaces
+    /// with the active one highlighted.
+    fn show_workspaces_pane(&mut self, ui: &mut egui::Ui) {
+        let active_index = self.workspaces.active_index();
+        let names: Vec<String> = self.workspaces.iter().map(|w| w.name()).collect();
+        let mut clicked = None;
+
+        egui::Panel::left("workspaces_pane")
+            .default_size(180.0)
+            .show(ui, |ui| {
+                ui.heading("Workspaces");
+                ui.separator();
+                if names.is_empty() {
+                    ui.label("(drop a folder to open a workspace)");
+                } else {
+                    for (i, name) in names.iter().enumerate() {
+                        if ui.selectable_label(Some(i) == active_index, name).clicked() {
+                            clicked = Some(i);
+                        }
+                    }
+                }
+            });
+
+        if let Some(i) = clicked {
+            self.workspaces.select(i);
         }
     }
 }
@@ -52,24 +133,21 @@ impl eframe::App for MarkSpaceApp {
         // ends before we draw into `ui` below.
         let ctx = ui.ctx().clone();
         self.handle_shortcuts(&ctx);
+        self.handle_drops(&ctx);
+        self.sync_active_scan();
+        self.drain_scan(&ctx);
 
-        // Panel A: far-left projects pane.
-        if self.workspace.show_projects_pane {
-            egui::Panel::left("projects_pane")
-                .default_size(180.0)
-                .show(ui, |ui| {
-                    ui.heading("Projects");
-                    ui.separator();
-                    ui.label("(no projects registered)");
-                });
+        // Panel A: far-left workspaces pane.
+        if self.layout.show_workspaces_pane {
+            self.show_workspaces_pane(ui);
         }
 
         // Panel C: far-right context column — file tree over quick info.
-        if self.workspace.show_context_column {
+        if self.layout.show_context_column {
             egui::Panel::right("context_column")
                 .default_size(260.0)
                 .show(ui, |ui| {
-                    if self.workspace.quick_info_expanded {
+                    if self.layout.quick_info_expanded {
                         egui::Panel::bottom("quick_info")
                             .resizable(false)
                             .show(ui, |ui| {
@@ -79,7 +157,18 @@ impl eframe::App for MarkSpaceApp {
                     }
                     egui::CentralPanel::default().show(ui, |ui| {
                         ui.heading("File Tree");
-                        ui.label("(no project open)");
+                        if self.workspaces.active().is_none() {
+                            ui.label("(no workspace open)");
+                        } else if self.scan_rx.is_some() {
+                            ui.label("Scanning…");
+                        } else {
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                for entry in &self.entries {
+                                    let icon = if entry.is_dir { "📁" } else { "📄" };
+                                    ui.label(format!("{icon}  {}", entry.name));
+                                }
+                            });
+                        }
                     });
                 });
         }

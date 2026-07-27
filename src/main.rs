@@ -1,4 +1,5 @@
 mod app;
+mod layout;
 mod workspace;
 
 use app::MarkSpaceApp;
