@@ -1,18 +1,25 @@
 //! The eframe application shell for MarkSpace.
 //!
-//! This is thin glue: every frame it wires keyboard shortcuts to [`Layout`]
-//! toggle methods, then draws the three-panel layout based on the resulting
-//! state. All layout *logic* lives in [`Layout`] and workspace logic in
-//! [`WorkspaceList`]; this module only renders them. See `CONTEXT.md` for the
-//! panel vocabulary.
+//! Thin glue: each frame it wires keyboard shortcuts and arrow-key navigation
+//! to the state types ([`Layout`], [`WorkspaceList`], [`FileTree`]), then draws
+//! the three-panel layout. All logic lives in those types; this module only
+//! renders them and routes input. See `CONTEXT.md` for the vocabulary.
 
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
 use eframe::egui;
 
+use crate::file_tree::FileTree;
 use crate::layout::Layout;
 use crate::workspace::{spawn_scan, Node, WorkspaceList};
+
+/// Which pane the arrow keys currently drive.
+#[derive(PartialEq, Clone, Copy)]
+enum FocusPane {
+    Workspaces,
+    Files,
+}
 
 /// The top-level MarkSpace application.
 pub struct MarkSpaceApp {
@@ -20,13 +27,26 @@ pub struct MarkSpaceApp {
     layout: Layout,
     /// Open workspaces, one active, shown in the Workspaces Pane.
     workspaces: WorkspaceList,
-    /// Nested File Tree for the active workspace.
-    tree: Vec<Node>,
+    /// Expansion + selection state for the active workspace's File Tree.
+    file_tree: FileTree,
     /// Pending background scan; drained each frame until it delivers.
     scan_rx: Option<Receiver<Vec<Node>>>,
-    /// Which workspace root `tree`/`scan_rx` correspond to, so we rescan
-    /// only when the active workspace changes.
+    /// Which workspace root the current `file_tree`/`scan_rx` correspond to, so
+    /// we rescan only when the active workspace changes.
     scanned_root: Option<PathBuf>,
+    /// Which pane the arrow keys drive.
+    focus: FocusPane,
+}
+
+/// Row data collected from the `FileTree` for a frame, owned so rendering and
+/// click-handling don't hold a borrow on `self.file_tree` while it mutates.
+struct FileRow {
+    path: PathBuf,
+    name: String,
+    is_dir: bool,
+    depth: usize,
+    expanded: bool,
+    selected: bool,
 }
 
 impl MarkSpaceApp {
@@ -35,20 +55,58 @@ impl MarkSpaceApp {
         Self {
             layout: Layout::new(),
             workspaces: WorkspaceList::new(),
-            tree: Vec::new(),
+            file_tree: FileTree::new(Vec::new()),
             scan_rx: None,
             scanned_root: None,
+            focus: FocusPane::Files,
         }
     }
 
     /// Open a folder dropped anywhere on the window as a workspace. macOS/winit
     /// doesn't report *where* an external file-drop landed, so we can't scope
-    /// the drop to the Workspaces Pane; a drop always means "add a workspace".
-    /// Non-directory drops are ignored by `WorkspaceList::open`.
+    /// the drop to the Workspaces Pane (ADR 0003); a drop always adds a
+    /// workspace. Non-directory drops are ignored by `WorkspaceList::open`.
     fn handle_drops(&mut self, ctx: &egui::Context) {
         let dropped = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
         if let Some(path) = dropped {
             self.workspaces.open(path);
+        }
+    }
+
+    /// Route arrow keys to the focused pane.
+    fn handle_navigation(&mut self, ctx: &egui::Context) {
+        use egui::{Key, Modifiers};
+        let key = |k| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k));
+        let (up, down, left, right) = (
+            key(Key::ArrowUp),
+            key(Key::ArrowDown),
+            key(Key::ArrowLeft),
+            key(Key::ArrowRight),
+        );
+
+        match self.focus {
+            FocusPane::Workspaces => {
+                if up {
+                    self.workspaces.select_prev();
+                }
+                if down {
+                    self.workspaces.select_next();
+                }
+            }
+            FocusPane::Files => {
+                if up {
+                    self.file_tree.select_prev();
+                }
+                if down {
+                    self.file_tree.select_next();
+                }
+                if left {
+                    self.file_tree.move_left();
+                }
+                if right {
+                    self.file_tree.move_right();
+                }
+            }
         }
     }
 
@@ -57,7 +115,7 @@ impl MarkSpaceApp {
         let active_root = self.workspaces.active().map(|w| w.root.clone());
         if active_root != self.scanned_root {
             self.scanned_root = active_root.clone();
-            self.tree.clear();
+            self.file_tree = FileTree::new(Vec::new());
             self.scan_rx = active_root.map(spawn_scan);
         }
     }
@@ -67,7 +125,7 @@ impl MarkSpaceApp {
         if let Some(rx) = &self.scan_rx {
             match rx.try_recv() {
                 Ok(tree) => {
-                    self.tree = tree;
+                    self.file_tree = FileTree::new(tree);
                     self.scan_rx = None;
                 }
                 Err(_) => ctx.request_repaint(), // scan still running
@@ -98,46 +156,39 @@ impl MarkSpaceApp {
         }
     }
 
-    /// Draw the far-left Workspaces Pane: a clickable list of open workspaces
-    /// with the active one highlighted.
+    /// Draw the far-left Workspaces Pane: a full-width, clickable list of open
+    /// workspaces with the active one highlighted.
     fn show_workspaces_pane(&mut self, ui: &mut egui::Ui) {
         let active_index = self.workspaces.active_index();
         let names: Vec<String> = self.workspaces.iter().map(|w| w.name()).collect();
+        let focused = self.focus == FocusPane::Workspaces;
         let mut clicked = None;
 
         egui::Panel::left("workspaces_pane")
             .default_size(180.0)
             .show(ui, |ui| {
-                ui.heading("Workspaces");
+                ui.heading(if focused { "▸ Workspaces" } else { "Workspaces" });
                 ui.separator();
                 if names.is_empty() {
                     ui.label("(drop a folder to open a workspace)");
                 } else {
-                    for (i, name) in names.iter().enumerate() {
-                        if ui.selectable_label(Some(i) == active_index, name).clicked() {
-                            clicked = Some(i);
-                        }
-                    }
+                    ui.with_layout(
+                        egui::Layout::top_down_justified(egui::Align::LEFT),
+                        |ui| {
+                            for (i, name) in names.iter().enumerate() {
+                                let selected = Some(i) == active_index;
+                                if ui.selectable_label(selected, name.as_str()).clicked() {
+                                    clicked = Some(i);
+                                }
+                            }
+                        },
+                    );
                 }
             });
 
         if let Some(i) = clicked {
             self.workspaces.select(i);
-        }
-    }
-}
-
-/// Recursively render File Tree nodes: directories as collapsible headers
-/// (egui persists their open/closed state across frames, keyed by path), files
-/// as leaf labels.
-fn show_tree(ui: &mut egui::Ui, nodes: &[Node]) {
-    for node in nodes {
-        if node.is_dir {
-            egui::CollapsingHeader::new(format!("📁  {}", node.name))
-                .id_salt(&node.path)
-                .show(ui, |ui| show_tree(ui, &node.children));
-        } else {
-            ui.label(format!("📄  {}", node.name));
+            self.focus = FocusPane::Workspaces;
         }
     }
 }
@@ -149,6 +200,7 @@ impl eframe::App for MarkSpaceApp {
         let ctx = ui.ctx().clone();
         self.handle_shortcuts(&ctx);
         self.handle_drops(&ctx);
+        self.handle_navigation(&ctx);
         self.sync_active_scan();
         self.drain_scan(&ctx);
 
@@ -156,6 +208,27 @@ impl eframe::App for MarkSpaceApp {
         if self.layout.show_workspaces_pane {
             self.show_workspaces_pane(ui);
         }
+
+        // Collect File Tree rows up front (owned) so the render closures don't
+        // hold a borrow on `self.file_tree` while we apply clicks afterwards.
+        let selected = self.file_tree.selected().map(|p| p.to_path_buf());
+        let rows: Vec<FileRow> = self
+            .file_tree
+            .visible_rows()
+            .iter()
+            .map(|r| FileRow {
+                selected: Some(r.node.path.as_path()) == selected.as_deref(),
+                path: r.node.path.clone(),
+                name: r.node.name.clone(),
+                is_dir: r.node.is_dir,
+                depth: r.depth,
+                expanded: r.expanded,
+            })
+            .collect();
+        let no_workspace = self.workspaces.active().is_none();
+        let scanning = self.scan_rx.is_some();
+        let files_focused = self.focus == FocusPane::Files;
+        let mut file_clicked: Option<(PathBuf, bool)> = None;
 
         // Panel C: far-right context column — file tree over quick info.
         if self.layout.show_context_column {
@@ -171,18 +244,32 @@ impl eframe::App for MarkSpaceApp {
                             });
                     }
                     egui::CentralPanel::default().show(ui, |ui| {
-                        ui.heading("File Tree");
-                        if self.workspaces.active().is_none() {
+                        ui.heading(if files_focused { "▸ File Tree" } else { "File Tree" });
+                        if no_workspace {
                             ui.label("(no workspace open)");
-                        } else if self.scan_rx.is_some() {
+                        } else if scanning {
                             ui.label("Scanning…");
                         } else {
-                            egui::ScrollArea::vertical().show(ui, |ui| {
-                                show_tree(ui, &self.tree);
-                            });
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    for row in &rows {
+                                        if row_clicked(ui, row) {
+                                            file_clicked = Some((row.path.clone(), row.is_dir));
+                                        }
+                                    }
+                                });
                         }
                     });
                 });
+        }
+
+        if let Some((path, is_dir)) = file_clicked {
+            self.file_tree.select(path.clone());
+            if is_dir {
+                self.file_tree.toggle_expanded(&path);
+            }
+            self.focus = FocusPane::Files;
         }
 
         // Panel B: center editor canvas, always visible.
@@ -191,4 +278,36 @@ impl eframe::App for MarkSpaceApp {
             ui.label("Editor canvas — WYSIWYG engine lands in Phase 4.");
         });
     }
+}
+
+/// Render one File Tree row as a full-width, left-aligned, indented selectable
+/// item with faint indent-guide lines. Directories show a ▸/▾ disclosure
+/// triangle. Returns whether it was clicked.
+fn row_clicked(ui: &mut egui::Ui, row: &FileRow) -> bool {
+    const INDENT: f32 = 14.0;
+    let icon = if row.is_dir {
+        if row.expanded { "▾ 📁" } else { "▸ 📁" }
+    } else {
+        "📄"
+    };
+    let text = format!("{icon}  {}", row.name);
+
+    let inner = ui.horizontal(|ui| {
+        ui.add_space(row.depth as f32 * INDENT);
+        ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+            ui.selectable_label(row.selected, text).clicked()
+        })
+        .inner
+    });
+
+    // Faint vertical guide line at each ancestor indent level.
+    let rect = inner.response.rect;
+    let color = ui.visuals().weak_text_color();
+    for level in 0..row.depth {
+        let x = rect.left() + level as f32 * INDENT + 7.0;
+        ui.painter()
+            .vline(x, rect.y_range(), egui::Stroke::new(1.0, color));
+    }
+
+    inner.inner
 }
