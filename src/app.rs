@@ -11,6 +11,7 @@ use std::sync::mpsc::{self, Receiver};
 use eframe::egui;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
+use crate::config::Config;
 use crate::file_tree::FileTree;
 use crate::layout::Layout;
 use crate::workspace::{spawn_scan, Node, WorkspaceList};
@@ -45,6 +46,8 @@ pub struct MarkSpaceApp {
     watch_rx: Option<Receiver<()>>,
     /// A filesystem change is pending a rescan (coalesces event bursts).
     dirty: bool,
+    /// Where the recent-workspace registry is persisted, if a home dir exists.
+    config_path: Option<PathBuf>,
     /// Which pane the arrow keys drive.
     focus: FocusPane,
 }
@@ -61,11 +64,17 @@ struct FileRow {
 }
 
 impl MarkSpaceApp {
-    /// Build the app with a default layout and no workspaces open.
+    /// Build the app, restoring the recent-workspace registry from config.
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        let config_path = default_config_path();
+        let workspaces = match &config_path {
+            Some(path) => WorkspaceList::from_paths(Config::load(path).workspaces),
+            None => WorkspaceList::new(),
+        };
+
         Self {
             layout: Layout::new(),
-            workspaces: WorkspaceList::new(),
+            workspaces,
             file_tree: FileTree::new(Vec::new()),
             scan_rx: None,
             scan_is_refresh: false,
@@ -73,7 +82,18 @@ impl MarkSpaceApp {
             watcher: None,
             watch_rx: None,
             dirty: false,
+            config_path,
             focus: FocusPane::Files,
+        }
+    }
+
+    /// Persist the current recent-workspace registry (best-effort).
+    fn save_config(&self) {
+        if let Some(path) = &self.config_path {
+            let config = Config {
+                workspaces: self.workspaces.paths(),
+            };
+            let _ = config.save(path);
         }
     }
 
@@ -81,10 +101,12 @@ impl MarkSpaceApp {
     /// doesn't report *where* an external file-drop landed, so we can't scope
     /// the drop to the Workspaces Pane (ADR 0003); a drop always adds a
     /// workspace. Non-directory drops are ignored by `WorkspaceList::open`.
-    fn handle_drops(&mut self, ctx: &egui::Context) {
+    /// Returns whether a workspace was opened (so the caller can persist).
+    fn handle_drops(&mut self, ctx: &egui::Context) -> bool {
         let dropped = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
-        if let Some(path) = dropped {
-            self.workspaces.open(path);
+        match dropped {
+            Some(path) => self.workspaces.open(path),
+            None => false,
         }
     }
 
@@ -259,7 +281,9 @@ impl eframe::App for MarkSpaceApp {
         // ends before we draw into `ui` below.
         let ctx = ui.ctx().clone();
         self.handle_shortcuts(&ctx);
-        self.handle_drops(&ctx);
+        if self.handle_drops(&ctx) {
+            self.save_config();
+        }
         self.handle_navigation(&ctx);
         self.sync_active_workspace(&ctx);
         self.poll_watch();
@@ -339,6 +363,12 @@ impl eframe::App for MarkSpaceApp {
             ui.label("Editor canvas — WYSIWYG engine lands in Phase 4.");
         });
     }
+}
+
+/// The config location per the PRD: `~/.config/markspace/config.toml` (note:
+/// explicitly `~/.config`, even on macOS). `None` if there's no home dir.
+fn default_config_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".config/markspace/config.toml"))
 }
 
 /// Start a recursive filesystem watcher on `root`. Each change sends a signal

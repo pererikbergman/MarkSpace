@@ -35,6 +35,9 @@ impl Workspace {
     }
 }
 
+/// Maximum recent workspaces kept in the list / persisted (PRD §4.1).
+const MAX_RECENT: usize = 20;
+
 /// The set of open workspaces, cmux-style, with one selected as active.
 pub struct WorkspaceList {
     items: Vec<Workspace>,
@@ -55,14 +58,17 @@ impl WorkspaceList {
     pub fn open(&mut self, path: PathBuf) -> bool {
         match Workspace::open(path) {
             Some(workspace) => {
-                let index = self
-                    .items
-                    .iter()
-                    .position(|w| w.root == workspace.root)
-                    .unwrap_or_else(|| {
+                let index = match self.items.iter().position(|w| w.root == workspace.root) {
+                    Some(i) => i,
+                    None => {
                         self.items.push(workspace);
+                        // Cap the list, dropping the oldest (front) entry.
+                        if self.items.len() > MAX_RECENT {
+                            self.items.remove(0);
+                        }
                         self.items.len() - 1
-                    });
+                    }
+                };
                 self.active = Some(index);
                 true
             }
@@ -93,6 +99,23 @@ impl WorkspaceList {
         } else if !self.items.is_empty() {
             self.select(0);
         }
+    }
+
+    /// Rebuild the list from persisted roots (startup), keeping those that
+    /// still exist as directories, capped and de-duplicated, with nothing
+    /// active until the user picks one.
+    pub fn from_paths(paths: Vec<PathBuf>) -> Self {
+        let mut list = Self::new();
+        for path in paths {
+            list.open(path);
+        }
+        list.active = None;
+        list
+    }
+
+    /// The workspace roots in list order, for persisting to config.
+    pub fn paths(&self) -> Vec<PathBuf> {
+        self.items.iter().map(|w| w.root.clone()).collect()
     }
 
     /// The currently active workspace, if any.
@@ -317,6 +340,49 @@ mod tests {
         let workspace = Workspace::open(sub).unwrap();
 
         assert_eq!(workspace.name(), "my-notes");
+    }
+
+    #[test]
+    fn from_paths_restores_existing_dirs_with_nothing_active() {
+        let a = tempdir().unwrap();
+        let b = tempdir().unwrap();
+        let bad = a.path().join("gone"); // never created
+
+        let list = WorkspaceList::from_paths(vec![
+            a.path().to_path_buf(),
+            bad,
+            b.path().to_path_buf(),
+        ]);
+
+        assert_eq!(
+            list.paths(),
+            vec![a.path().to_path_buf(), b.path().to_path_buf()],
+            "stale path filtered, order preserved"
+        );
+        assert!(list.active().is_none(), "nothing active until the user picks");
+    }
+
+    #[test]
+    fn open_caps_the_list_at_twenty_dropping_the_oldest() {
+        let root = tempdir().unwrap();
+        let mut list = WorkspaceList::new();
+        let mut dirs = Vec::new();
+        for i in 0..21 {
+            let p = root.path().join(format!("w{i:02}"));
+            fs::create_dir(&p).unwrap();
+            list.open(p.clone());
+            dirs.push(p);
+        }
+
+        assert_eq!(list.iter().count(), 20, "capped at 20");
+        assert!(
+            list.iter().all(|w| w.root != dirs[0]),
+            "oldest (w00) was dropped"
+        );
+        assert!(
+            list.iter().any(|w| w.root == dirs[20]),
+            "newest (w20) is kept"
+        );
     }
 
     #[test]
