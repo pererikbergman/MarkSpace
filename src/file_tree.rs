@@ -46,6 +46,18 @@ impl FileTree {
         self.expanded.contains(path)
     }
 
+    /// Replace the tree after a rescan, preserving expand/collapse and
+    /// selection for paths that still exist (stale entries are pruned).
+    pub fn update_roots(&mut self, roots: Vec<Node>) {
+        self.roots = roots;
+        self.expanded.retain(|p| find_node(&self.roots, p).is_some());
+        if let Some(sel) = &self.selected
+            && find_node(&self.roots, sel).is_none()
+        {
+            self.selected = None;
+        }
+    }
+
     /// Select a node by path (e.g. from a click).
     pub fn select(&mut self, path: PathBuf) {
         self.selected = Some(path);
@@ -295,6 +307,55 @@ mod tests {
 
         tree.move_right(); // on a file -> no change
         assert_eq!(tree.selected(), Some(Path::new("/w/src/main.rs")));
+    }
+
+    #[test]
+    fn update_roots_preserves_expansion_and_shows_new_entries() {
+        let mut tree = FileTree::new(vec![dir("/w/src", vec![file("/w/src/main.rs")])]);
+        tree.toggle_expanded(&PathBuf::from("/w/src"));
+
+        // A new file appeared under src (filesystem changed → rescan).
+        tree.update_roots(vec![dir(
+            "/w/src",
+            vec![file("/w/src/main.rs"), file("/w/src/lib.rs")],
+        )]);
+
+        assert!(tree.is_expanded(Path::new("/w/src")), "expansion preserved");
+        assert_eq!(
+            names(&tree.visible_rows()),
+            ["src", "main.rs", "lib.rs"],
+            "new file is visible under the still-expanded folder"
+        );
+    }
+
+    #[test]
+    fn update_roots_keeps_selection_if_present_else_clears_it() {
+        let mut tree = FileTree::new(vec![file("/w/a.md"), file("/w/b.md")]);
+        tree.select(PathBuf::from("/w/b.md"));
+
+        // b.md still there -> selection kept.
+        tree.update_roots(vec![file("/w/a.md"), file("/w/b.md")]);
+        assert_eq!(tree.selected(), Some(Path::new("/w/b.md")));
+
+        // b.md deleted -> selection cleared.
+        tree.update_roots(vec![file("/w/a.md")]);
+        assert_eq!(tree.selected(), None);
+    }
+
+    #[test]
+    fn update_roots_prunes_expansion_of_removed_folders() {
+        let mut tree = FileTree::new(vec![
+            dir("/w/a", vec![file("/w/a/x.md")]),
+            dir("/w/b", vec![file("/w/b/y.md")]),
+        ]);
+        tree.toggle_expanded(&PathBuf::from("/w/a"));
+        tree.toggle_expanded(&PathBuf::from("/w/b"));
+
+        // Folder b was deleted.
+        tree.update_roots(vec![dir("/w/a", vec![file("/w/a/x.md")])]);
+
+        assert!(tree.is_expanded(Path::new("/w/a")), "surviving folder stays expanded");
+        assert!(!tree.is_expanded(Path::new("/w/b")), "removed folder's expansion pruned");
     }
 
     #[test]
