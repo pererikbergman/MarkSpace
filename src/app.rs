@@ -12,7 +12,7 @@ use eframe::egui;
 
 use crate::layout::Layout;
 use crate::live_tree::LiveTree;
-use crate::quick_info::{format_age, format_size, QuickInfo};
+use crate::quick_info::{file_changed, format_age, format_size, QuickInfo};
 use crate::registry::WorkspaceRegistry;
 
 /// Which pane the arrow keys currently drive.
@@ -66,12 +66,25 @@ impl MarkSpaceApp {
         }
     }
 
-    /// Recompute the active file's Quick Info when the active file changes.
-    fn sync_quick_info(&mut self) {
+    /// Recompute the active file's Quick Info when the active file changes, or
+    /// (on a filesystem `refreshed` pulse) when that file's size/mtime moved on
+    /// disk. Edits to other files don't recompute the active file's stats.
+    fn sync_quick_info(&mut self, refreshed: bool) {
         let active_file = self.live_tree.tree().selected_file().map(Path::to_path_buf);
-        if active_file == self.quick_info_path {
+
+        let recompute = if active_file != self.quick_info_path {
+            true // the active file itself changed
+        } else if refreshed {
+            active_file
+                .as_deref()
+                .is_some_and(|f| file_changed(self.quick_info.as_ref(), f))
+        } else {
+            false
+        };
+        if !recompute {
             return;
         }
+
         self.quick_info_path = active_file.clone();
         let root = self.workspaces.active().map(|w| w.root.clone());
         self.quick_info = match (active_file, root) {
@@ -202,8 +215,8 @@ impl eframe::App for MarkSpaceApp {
         // Keep the live tree pointed at the active workspace and advance it.
         self.live_tree
             .set_root(self.workspaces.active().map(|w| w.root.clone()));
-        self.live_tree.poll();
-        self.sync_quick_info();
+        let refreshed = self.live_tree.poll();
+        self.sync_quick_info(refreshed);
 
         // Panel A: far-left workspaces pane.
         if self.layout.show_workspaces_pane {
