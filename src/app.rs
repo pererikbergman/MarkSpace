@@ -1,20 +1,17 @@
 //! The eframe application shell for MarkSpace.
 //!
 //! Thin glue: each frame it wires keyboard shortcuts and arrow-key navigation
-//! to the state types ([`Layout`], [`WorkspaceList`], [`FileTree`]), then draws
+//! to the state types ([`Layout`], [`WorkspaceList`], [`LiveTree`]), then draws
 //! the three-panel layout. All logic lives in those types; this module only
 //! renders them and routes input. See `CONTEXT.md` for the vocabulary.
 
-use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
+use std::path::PathBuf;
 
 use eframe::egui;
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::config::Config;
-use crate::file_tree::FileTree;
 use crate::layout::Layout;
-use crate::scan::{spawn_scan, Node};
+use crate::live_tree::LiveTree;
 use crate::workspace::WorkspaceList;
 
 /// Which pane the arrow keys currently drive.
@@ -30,23 +27,8 @@ pub struct MarkSpaceApp {
     layout: Layout,
     /// Open workspaces, one active, shown in the Workspaces Pane.
     workspaces: WorkspaceList,
-    /// Expansion + selection state for the active workspace's File Tree.
-    file_tree: FileTree,
-    /// Pending background scan; drained each frame until it delivers.
-    scan_rx: Option<Receiver<Vec<Node>>>,
-    /// Whether the pending scan is a live refresh (preserve expand/selection)
-    /// rather than an initial load (reset state).
-    scan_is_refresh: bool,
-    /// Which workspace root the current `file_tree`/`scan_rx` correspond to, so
-    /// we rescan only when the active workspace changes.
-    scanned_root: Option<PathBuf>,
-    /// Filesystem watcher on the active workspace root; kept alive here so
-    /// dropping/replacing it re-points watching when the workspace changes.
-    watcher: Option<RecommendedWatcher>,
-    /// Signals from the watcher that the workspace changed on disk.
-    watch_rx: Option<Receiver<()>>,
-    /// A filesystem change is pending a rescan (coalesces event bursts).
-    dirty: bool,
+    /// The active workspace's File Tree, kept live with the filesystem.
+    live_tree: LiveTree,
     /// Where the recent-workspace registry is persisted, if a home dir exists.
     config_path: Option<PathBuf>,
     /// Which pane the arrow keys drive.
@@ -54,7 +36,7 @@ pub struct MarkSpaceApp {
 }
 
 /// Row data collected from the `FileTree` for a frame, owned so rendering and
-/// click-handling don't hold a borrow on `self.file_tree` while it mutates.
+/// click-handling don't hold a borrow on `live_tree` while it mutates.
 struct FileRow {
     path: PathBuf,
     name: String,
@@ -66,23 +48,21 @@ struct FileRow {
 
 impl MarkSpaceApp {
     /// Build the app, restoring the recent-workspace registry from config.
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let config_path = default_config_path();
         let workspaces = match &config_path {
             Some(path) => WorkspaceList::from_paths(Config::load(path).workspaces),
             None => WorkspaceList::new(),
         };
 
+        // Repaint the UI when the live tree wants attention (scan done, fs event).
+        let ctx = cc.egui_ctx.clone();
+        let live_tree = LiveTree::new(move || ctx.request_repaint());
+
         Self {
             layout: Layout::new(),
             workspaces,
-            file_tree: FileTree::new(Vec::new()),
-            scan_rx: None,
-            scan_is_refresh: false,
-            scanned_root: None,
-            watcher: None,
-            watch_rx: None,
-            dirty: false,
+            live_tree,
             config_path,
             focus: FocusPane::Files,
         }
@@ -132,86 +112,19 @@ impl MarkSpaceApp {
                 }
             }
             FocusPane::Files => {
+                let tree = self.live_tree.tree_mut();
                 if up {
-                    self.file_tree.select_prev();
+                    tree.select_prev();
                 }
                 if down {
-                    self.file_tree.select_next();
+                    tree.select_next();
                 }
                 if left {
-                    self.file_tree.move_left();
+                    tree.move_left();
                 }
                 if right {
-                    self.file_tree.move_right();
+                    tree.move_right();
                 }
-            }
-        }
-    }
-
-    /// When the active workspace changes, reset the tree, kick off an initial
-    /// scan, and re-point the filesystem watcher (dropping the old one).
-    fn sync_active_workspace(&mut self, ctx: &egui::Context) {
-        let active_root = self.workspaces.active().map(|w| w.root.clone());
-        if active_root == self.scanned_root {
-            return;
-        }
-        self.scanned_root = active_root.clone();
-        self.file_tree = FileTree::new(Vec::new());
-        self.dirty = false;
-
-        match active_root {
-            Some(root) => {
-                self.scan_is_refresh = false;
-                self.scan_rx = Some(spawn_scan(root.clone()));
-                match spawn_watch(&root, ctx.clone()) {
-                    Some((watcher, rx)) => {
-                        self.watcher = Some(watcher);
-                        self.watch_rx = Some(rx);
-                    }
-                    None => {
-                        self.watcher = None;
-                        self.watch_rx = None;
-                    }
-                }
-            }
-            None => {
-                self.scan_rx = None;
-                self.watcher = None;
-                self.watch_rx = None;
-            }
-        }
-    }
-
-    /// Drain watcher signals and, once idle, coalesce them into a single live
-    /// rescan of the active workspace.
-    fn poll_watch(&mut self) {
-        if let Some(rx) = &self.watch_rx {
-            while rx.try_recv().is_ok() {
-                self.dirty = true;
-            }
-        }
-        if self.dirty && self.scan_rx.is_none() {
-            if let Some(root) = self.scanned_root.clone() {
-                self.scan_is_refresh = true;
-                self.scan_rx = Some(spawn_scan(root));
-            }
-            self.dirty = false;
-        }
-    }
-
-    /// Drain a pending background scan; keep repainting until it arrives.
-    fn drain_scan(&mut self, ctx: &egui::Context) {
-        if let Some(rx) = &self.scan_rx {
-            match rx.try_recv() {
-                Ok(tree) => {
-                    if self.scan_is_refresh {
-                        self.file_tree.update_roots(tree); // live refresh: keep state
-                    } else {
-                        self.file_tree = FileTree::new(tree); // initial load: reset
-                    }
-                    self.scan_rx = None;
-                }
-                Err(_) => ctx.request_repaint(), // scan still running
             }
         }
     }
@@ -286,9 +199,11 @@ impl eframe::App for MarkSpaceApp {
             self.save_config();
         }
         self.handle_navigation(&ctx);
-        self.sync_active_workspace(&ctx);
-        self.poll_watch();
-        self.drain_scan(&ctx);
+
+        // Keep the live tree pointed at the active workspace and advance it.
+        self.live_tree
+            .set_root(self.workspaces.active().map(|w| w.root.clone()));
+        self.live_tree.poll();
 
         // Panel A: far-left workspaces pane.
         if self.layout.show_workspaces_pane {
@@ -296,10 +211,11 @@ impl eframe::App for MarkSpaceApp {
         }
 
         // Collect File Tree rows up front (owned) so the render closures don't
-        // hold a borrow on `self.file_tree` while we apply clicks afterwards.
-        let selected = self.file_tree.selected().map(|p| p.to_path_buf());
+        // hold a borrow on `live_tree` while we apply clicks afterwards.
+        let selected = self.live_tree.tree().selected().map(|p| p.to_path_buf());
         let rows: Vec<FileRow> = self
-            .file_tree
+            .live_tree
+            .tree()
             .visible_rows()
             .iter()
             .map(|r| FileRow {
@@ -312,7 +228,7 @@ impl eframe::App for MarkSpaceApp {
             })
             .collect();
         let no_workspace = self.workspaces.active().is_none();
-        let scanning = self.scan_rx.is_some();
+        let scanning = self.live_tree.is_scanning();
         let files_focused = self.focus == FocusPane::Files;
         let mut file_clicked: Option<(PathBuf, bool)> = None;
 
@@ -351,9 +267,10 @@ impl eframe::App for MarkSpaceApp {
         }
 
         if let Some((path, is_dir)) = file_clicked {
-            self.file_tree.select(path.clone());
+            let tree = self.live_tree.tree_mut();
+            tree.select(path.clone());
             if is_dir {
-                self.file_tree.toggle_expanded(&path);
+                tree.toggle_expanded(&path);
             }
             self.focus = FocusPane::Files;
         }
@@ -370,23 +287,6 @@ impl eframe::App for MarkSpaceApp {
 /// explicitly `~/.config`, even on macOS). `None` if there's no home dir.
 fn default_config_path() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".config/markspace/config.toml"))
-}
-
-/// Start a recursive filesystem watcher on `root`. Each change sends a signal
-/// over the channel and requests a repaint so the UI wakes to rescan. Returns
-/// the watcher (which must be kept alive) and the receiver, or `None` if the
-/// watcher couldn't be created. Non-UI I/O, verified by running.
-fn spawn_watch(root: &Path, ctx: egui::Context) -> Option<(RecommendedWatcher, Receiver<()>)> {
-    let (tx, rx) = mpsc::channel();
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if res.is_ok() {
-            let _ = tx.send(());
-            ctx.request_repaint();
-        }
-    })
-    .ok()?;
-    watcher.watch(root, RecursiveMode::Recursive).ok()?;
-    Some((watcher, rx))
 }
 
 /// Render one File Tree row as a full-width, left-aligned, indented selectable
