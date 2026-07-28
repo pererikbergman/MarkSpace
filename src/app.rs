@@ -10,6 +10,7 @@ use std::time::SystemTime;
 
 use eframe::egui;
 
+use crate::document::Document;
 use crate::layout::Layout;
 use crate::live_tree::LiveTree;
 use crate::quick_info::{file_changed, format_age, format_size, QuickInfo};
@@ -34,6 +35,8 @@ pub struct MarkSpaceApp {
     quick_info: Option<QuickInfo>,
     /// The path `quick_info` was computed for (to detect active-file changes).
     quick_info_path: Option<PathBuf>,
+    /// The active file loaded as an editable buffer, if any.
+    document: Option<Document>,
     /// Which pane the arrow keys drive.
     focus: FocusPane,
 }
@@ -62,8 +65,20 @@ impl MarkSpaceApp {
             live_tree,
             quick_info: None,
             quick_info_path: None,
+            document: None,
             focus: FocusPane::Files,
         }
+    }
+
+    /// Load the active file into an editable buffer when it changes. The same
+    /// file is kept (edits aren't clobbered); a non-text file yields `None`.
+    fn sync_document(&mut self) {
+        let active_file = self.live_tree.tree().selected_file().map(Path::to_path_buf);
+        let current = self.document.as_ref().map(|d| d.path.clone());
+        if active_file == current {
+            return;
+        }
+        self.document = active_file.and_then(Document::open);
     }
 
     /// Recompute the active file's Quick Info when the active file changes, or
@@ -217,6 +232,7 @@ impl eframe::App for MarkSpaceApp {
             .set_root(self.workspaces.active().map(|w| w.root.clone()));
         let refreshed = self.live_tree.poll();
         self.sync_quick_info(refreshed);
+        self.sync_document();
 
         // Panel A: far-left workspaces pane.
         if self.layout.show_workspaces_pane {
@@ -310,9 +326,21 @@ impl eframe::App for MarkSpaceApp {
         }
 
         // Panel B: center editor canvas, always visible.
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("MarkSpace");
-            ui.label("Editor canvas — WYSIWYG engine lands in Phase 4.");
+        egui::CentralPanel::default().show(ui, |ui| match &mut self.document {
+            Some(doc) => {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut doc.text)
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+            }
+            None => {
+                ui.heading("MarkSpace");
+                ui.label("Select a file to edit — or open a workspace to begin.");
+            }
         });
     }
 }
