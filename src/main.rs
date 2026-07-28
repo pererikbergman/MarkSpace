@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod document;
 mod file_tree;
 mod layout;
 mod live_tree;
